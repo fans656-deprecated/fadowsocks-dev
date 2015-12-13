@@ -1,0 +1,216 @@
+2015-12-11 14:03:15
+弄到了shadowsocks的源码(python的)，打算爬一爬，然后尝试自己造个轮子出来
+途中可能会遇到各种相关问题、技术、idiom
+比如 absolute_import, select/poll..
+都在这里实践实践
+
+2015-12-11 14:06:50
+先来 absolute_import
+    
+    # shadowsocks/local.py
+    from __future__ import absolute_import
+
+https://www.python.org/dev/peps/pep-0328/
+
+2015-12-11 17:15:08
+TODO
+https://en.wikipedia.org/wiki/Epoll
+https://en.wikipedia.org/wiki/Kqueue
+https://en.wikipedia.org/wiki/Overlapped_I/O
+测试测试这些不同的异步IO模型的性能
+
+2015-12-11 17:45:27
+看完eventloop.py差不多理解事件驱动部分了
+就是拿 select 来异步处理所有 sockets 的读写
+
+2015-12-11 20:27:25
+tcp server socket 在
+    lsock.bind(addr)
+    lsock.listen(1024)
+之后，
+    select.select([lsock], [], [])
+一旦 readable ，那么一定就是
+    lsock.accept()
+
+2015-12-11 21:03:59
+https://github.com/shadowsocks/shadowsocks/tree/master
+https://en.wikipedia.org/wiki/SOCKS
+clowwindy的python这版的shadowsocks client直接不看来的TCP连接greeting是什么内容，sock.recv(32KB) 之后直接返回 '\x05\x00' —— 意即使用 SOCKS5 协议，no authentication
+
+https://shadowsocks.org/en/download/clients.html
+然后我测试了下 shadowsocks.org 的 windows client
+发现 greeting 发两个字节(第一个必须是'\x05'，第二个无所谓)就会收到回复 '\x05\x00'
+
+2015-12-11 21:16:05
+发现给 win client 用 TCP socket 发 HTTP 请求的时候，正常的
+    GET / HTTP/1.1
+    Host: baidu.com
+不好使，会被返回
+    HTTP/1.1 400 Invalid header received from client
+去chrome实地考察(设置 http proxy 为 127.0.0.1:1080)，发现人家发的是
+    GET http://www.baidu.com/ HTTP/1.1
+
+好像想起来了复试完在家当时宋美娜让看 HTTP The Definitive Guide 里面有提到
+发给 proxy 的请求跟发给正常 server 的请求有所区别
+等我去查查
+
+https://en.wikipedia.org/wiki/Proxy_server
+Proxy Server —— 先爬这家伙
+
+2015-12-11 22:08:11
+https://www.ietf.org/rfc/rfc2616.txt
+gotcha —— 这里说“The absoluteURI form is REQUIRED when the request is being made to a proxy”
+至于为什么..
+http://stackoverflow.com/questions/6586882/why-do-http-proxies-require-an-absolute-uri-in-their-get-requests
+这里说 Host header 是 HTTP1.1 才有的，那么在1.0的时候，只有 GET <uri>
+这对正常服务器是ok的，因为服务器知道要取的资源(/foo/bar.txt)是在自己这里
+但如果一个proxy收到 GET /foo/bar.txt HTTP/1.0 ，它就懵逼了~~
+所以用 absoluteURI 的办法解决
+后来到1.1有了Host，但之前的解决方式还是存留了下来
+
+HTTP The Definitive Guide 里面讲的很清楚，确实是1.0的遗留问题
+
+2015-12-11 22:24:46
+那么目前从代码来看，clowwindy 的 client 只支持 SOCKS5 连接
+ss.org 的 win client 支持 http, https, ftp, socks4, socks5 连接
+
+其实还有一个疑问，就是TCP往上是不区分应用层协议的
+win client 在 1080 端口接收所有的 tcp 数据，它是怎么区分来流是 http 呢还是 socks 还是别的什么？通过内容分析吗？
+
+2015-12-11 22:47:44
+https://github.com/shadowsocks/shadowsocks-windows/blob/master/shadowsocks-csharp/Controller/Service/TCPRelay.cs
+哈，原来 win client 也是 clowwindy 写的——用的 C#
+这里一句
+    if (length < 2 || firstPacket[0] != 5)
+    {
+        return false;
+    }
+正应了我前面描述的行为~~~
+
+2015-12-11 22:57:13
+https://github.com/shadowsocks/shadowsocks-windows/search?q=http&type=Issues&utf8=%E2%9C%93
+刚想起来之前用ss经常碰到一个叫prioxy的家伙
+在shadowsocks-windows的issues里看提到这个，加之在ss-win的代码里找不到http proxy相关——
+忽然意识到，ss是开了个 prioxy (这家伙本身就是个HTTP代理软件)然后自己作为二级代理！
+咦，但是它们是怎么共用的1080端口？
+
+2015-12-12 00:18:15
+快要触及多协议共用端口的秘密了
+Shadowsocks.exe 会启动一个 ss_privoxy.exe
+实验了下杀掉ss_privoxy，然后python写socket通过TCP发HTTP请求，ss就懵逼了(没有回复)，但此时发SOCKS5 greeting还是有回复的
+可以想见ss是把非SOCKS协议的处理都delegate给ss_privoxy了
+但是如何识别进来的TCP流是非SOCKS协议呢，继续追踪代码(PolipoRunner)
+
+2015-12-12 00:30:15
+https://github.com/shadowsocks/shadowsocks-windows/blob/2.5.8/shadowsocks-csharp/Controller/ShadowsocksController.cs
+https://github.com/shadowsocks/shadowsocks-windows/blob/2.5.8/shadowsocks-csharp/Controller/Service/PortForwarder.cs
+感觉重点在这两个文件里，但是有点晚了，还没看明白，，明儿继续
+
+2015-12-12 10:28:57
+感觉是明白了——在厕所时候琢磨到可能是ss-client收到的所有数据都转一份给privoxy，那么privoxy识别出来的http,https,ftp的流量就转成socks5再发回给ss-client
+
+回来看代码，重点在这几处
+
+    // shadowsocks-csharp/Controller/ShadowsocksController.cs
+    List<Listener.Service> services = new List<Listener.Service>();
+    services.Add(tcpRelay);
+    services.Add(udpRelay);
+    services.Add(_pacServer);
+    services.Add(new PortForwarder(polipoRunner.RunningPort));
+    _listener = new Listener(services);
+    _listener.Start(_config);
+
+    // shadowsocks-csharp/Controller/Service/Listener.cs
+    foreach (Service service in _services)
+    {
+        if (service.Handle(buf, bytesRead, conn, null))
+        {
+            return;
+        }
+    }
+
+也就是说，tcpRelay, udpRelay, PortForwarder 这几个家伙是依次处理来流的
+
+    // shadowsocks-csharp/Controller/Service/TCPRelay.cs
+    if (socket.ProtocolType != ProtocolType.Tcp)
+    {
+        return false;
+    }
+    if (length < 2 || firstPacket[0] != 5)
+    {
+        return false;
+    }
+
+这里TCPRelay就把非 SS5 的来流略过了
+
+    // shadowsocks-csharp/Controller/Service/UDPRelay.cs
+    if (socket.ProtocolType != ProtocolType.Udp)
+    {
+        return false;
+    }
+
+UDPRelay 略过非UDP来流
+
+然后就到了 PortForwarder 这里
+
+    // shadowsocks-csharp/Controller/Service/PortForwarder.cs
+    if (socket.ProtocolType != ProtocolType.Tcp)
+    {
+        return false;
+    }
+    new Handler().Start(firstPacket, length, socket, this._targetPort);
+    return true;
+
+Handler 做的基本就是原样转来流给 privoxy 了
+这里的 `this._targetPort` 是这么来的：
+    
+    // shadowsocks-csharp/Controller/ShadowsocksController.cs
+    services.Add(new PortForwarder(polipoRunner.RunningPort));
+
+然后 polipoRunner 做的就是启动 privoxy
+
+至此，真相大白~ 就是：
+ss-client 收到 ss5 来流就直接处理，非ss5的转给 privoxy
+然后 privoxy 处理过再转回给 ss-client (以类似chrome这样的正常application的身份)
+哦，对，在 ss_privoxy.exe 所处的文件夹里还有个 privoxy.conf ，内容如下
+
+    # C:\Users\Administrator\AppData\Local\Temp\privoxy.conf
+    listen-address 0.0.0.0:8123
+    show-on-task-bar 0
+    activity-animation 0
+    forward-socks5 / 127.0.0.1:1080 .
+    hide-console
+
+关于 privoxy 的整个流程自己假想了成立的但还没去看代码验证
+另外UDP DNS部分还没研究
+但起码之前疑惑的地方已经都明白了
+
+那么下来如果自己要写 fadowsocks，需要搞懂的就是 SOCKS5 协议了
+而且既然 ss-client 直接用 no authentication 的方式，自己也可以这么简单化处理
+client 跟 server 之间的协议就完全无所谓了，哪怕设计成 ROT13 都可以(但是加密总是应该的，怕被GFW内容分析)
+然后server那里就是正常的TCP了
+DNS部分也需要搞懂
+但这些就都是之后的事儿了，，手头这茬已圆满结束
+
+2015-12-13 11:01:12
+可以自己着手写了，情景不是很清楚，不过可以确定第一个阶段性目标：
+在本地和VPS上部署两个进程，使得可以通过chrome的SOCKS5代理协议访问google.com
+
+那么起手要做的，还是爬懂SOCKS5的wiki
+
+2015-12-13 11:19:02
+貌似chrome只会发 no authentication 的 socks5 greeting，所以 local client 是必要的
+
+chrome给的是domain name，那么到vps那边就得做DNS，不过python的sock.connect直接可以用domain name做地址，所以可以现在就试试
+
+2015-12-13 13:41:48
+呐，实现了
+    HEAD www.google.com HTTP/1.1
+本地一个 local.py ，VPS 上一个 server.py
+local 监听 6560 接收 SOCKS5 请求，转流给 server (rot13编码)
+server 建立 SOCKS header 里指定的 domain_name port 连接，拿到结果后回传给 client
+
+因为写得太原型，还没敢直接用chrome试，自己t.py手写的请求
+等我 select 并发搞起，错误控制做好，再来试浏览器的
+
+不知道今儿半天能搞定不？
