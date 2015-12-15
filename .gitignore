@@ -1,3 +1,4 @@
 experiments
 shadowsocks
 shadowsocks-windows-master
+*.pyc
