@@ -1,9 +1,9 @@
 import os
 
-local = os.environ.get('bandwagon', False)
+vps = os.environ.get('bandwagon', False)
 
-if local:
-    host = 'localhost'
-else:
+if vps:
     host = os.environ.get('vps', 'localhost')
+else:
+    host = 'localhost'
 server = (host, 6569)
