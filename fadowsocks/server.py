@@ -1,11 +1,13 @@
 import socket
-from f6.socket import Listener
 from common import encrypt, decrypt, parse_request_addr, BUF_SIZE
 import config
 
-l = Listener(config.server)
+lsock = socket.socket()
+lsock.bind(config.server)
+lsock.listen(1024)
+print 'listen at', lsock.getsockname()
 while True:
-    sock, addr = l.accept()
+    sock, addr = lsock.accept()
     print 'accept', addr
     try:
         cmd = sock.recv(1024)

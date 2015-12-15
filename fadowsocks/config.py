@@ -1,1 +1,1 @@
-server = ('localhost', 6569)
+server = ('', 6569)
