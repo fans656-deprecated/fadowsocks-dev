@@ -2,7 +2,7 @@ import socket
 import struct
 import time
 
-domain_name = 'xiami.com'
+domain_name = 'zhihu.com'
 by_domain = 1
 
 def request_by_domain():

@@ -45,21 +45,29 @@ class Relay(object):
         self.request_addr = None
 
     def on_read(self, sock):
-        data = sock.recv(BUF_SIZE)
+        try:
+            data = sock.recv(BUF_SIZE)
+        except Exception as e:
+            print e
+            self.destroy()
+            return
         if not data:
             self.destroy()
             return
         if sock == self.local_sock:
             if self.state == STATE_WAIT_GREETING:
                 print 'got greeting from {}: {}'.format(
-                    sock.getpeername(), repr(data))
+                    sock.getpeername(), len(data))
                 self.send('\x05\x00', self.local_sock)
                 self.state = STATE_WAIT_COMMAND
             elif self.state == STATE_WAIT_COMMAND:
                 self.on_command(data)
             elif self.state == STATE_CONNECTING:
                 self.data_to_remote.append(data)
-                print 'data from app while connecting:', repr(data)
+                print 'data from app while connecting:', len(data)
+            elif self.state == STATE_RELAYING:
+                print '->', len(data)
+                self.send(encrypt(data), self.remote_sock)
             else:
                 raise NotImplementedError('other state')
         elif sock == self.remote_sock:
@@ -102,7 +110,8 @@ class Relay(object):
             print e
             self.destroy()
         else:
-            self.send('\x05\x00', self.local_sock)
+            self.send('\x05\x00\x00\x01' + '\x00' * 6, self.local_sock)
+            print 'granted', self.local_addr
             self.cmd = cmd
             sock = socket.socket()
             self.remote_sock = sock
@@ -119,8 +128,11 @@ class Relay(object):
         except socket.error as e:
             self.destroy()
             return
+        data = data[:n_sent][:70]
+        if sock == self.remote_sock:
+            data = decrypt(data)
         print 'sent to {}: {}'.format(
-            sock.getpeername(), repr(data[:n_sent][:70]))
+            sock.getpeername(), len(data))
         if n_sent < n_total:
             if sock == self.local_sock:
                 self.data_to_local.append(data[n_sent:])
