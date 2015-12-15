@@ -5,6 +5,8 @@ import struct
 import config
 from common import parse_request_addr, encrypt, decrypt, BUF_SIZE
 
+print 'remote server at', config.server
+
 STATE_WAIT_GREETING = 0
 STATE_WAIT_COMMAND = 1
 STATE_CONNECTING = 2
@@ -132,6 +134,7 @@ class Relay(object):
 
     def destroy(self):
         print 'closed', self.local_addr
+        print
         destroy_socket(self.local_sock)
         destroy_socket(self.remote_sock)
 
