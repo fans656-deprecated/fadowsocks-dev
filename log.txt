@@ -214,3 +214,171 @@ server 建立 SOCKS header 里指定的 domain_name port 连接，拿到结果�
 等我 select 并发搞起，错误控制做好，再来试浏览器的
 
 不知道今儿半天能搞定不？
+
+2015-12-13 14:33:03
+我靠，一切换到 select 的模型忽然好难写
+
+2015-12-14 17:10:18
+client 收到 chrome 的 cmd request ("establish a tcp connection to google.com") 后，需要建立与 server 的 tcp 连接
+    sock.connect(..)
+直接在 on_recv 里头执行这个家伙会 defeat the whole point of using `select`
+因为这家伙实际上是 blocking 的
+于是再次引出 TCP Handshake，，在本机和Ubuntu VM上跑起python的 server, client然后 wireshark 抓包，现在在研究 tcp 的 psh flag
+
+2015-12-14 18:28:11
+http://packetlife.net/blog/2011/mar/2/tcp-flags-psh-and-urg/
+
+http://stackoverflow.com/questions/2264154/when-is-the-push-flag-set-in-tcp-segment
+TCP_NODELAY - 这个也在shadowsocks的源码里见过
+MSG_MORE - 这个是不是 PSH 置零？
+
+https://en.wikipedia.org/wiki/Nagle%27s_algorithm
+Nagle's algorithm 就是通过buffer application layer交下来的数据来提升网络利用率，但是会造成某些实施应用的高latency
+想试试能不能用socket测试出这种效应
+
+2015-12-14 20:17:52
+http://stackoverflow.com/questions/2231283/tcp-two-sides-trying-to-connect-simultaneously
+这里说TCP可以两方同时connect——即同时SYN, SYN/ACK, ACK
+这样也可以建立连接
+
+2015-12-14 20:58:57
+可以用 TCP_NODELAY 来 disable Nagle algorithm
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+    for _ in range(5):
+        sock.send('a')
+
+不设置的时候wireshark捕捉到有数据的包是2个
+    a (PSH, ACK, Len=1)
+    aaaa (PSH, ACK, Len=4)
+设置之后是5个
+    a (PSH, ACK, Len=1)
+    a (PSH, ACK, Len=1)
+    a (PSH, ACK, Len=1)
+    a (PSH, ACK, Len=1)
+    a (PSH, ACK, Len=1)
+
+2015-12-14 21:06:26
+http://stackoverflow.com/questions/9153566/difference-between-push-and-urgent-flags-in-tcp
+PUSH 和 URG 不太一样
+
+2015-12-14 21:16:15
+发现 send('a' * 1460 * 2) 的时候，wireshark 就会检测到两个包
+一个 [ACK, Len=1460], 紧跟着一个 [PSH, ACK, Len=1460]
+
+不是很清楚地感觉：TCP_NODELAY 只是在帮助处理 small packet 跟 Nagle's algorithm 的关系
+
+
+忽然想起来为什么5个a中第一个会 PSH 而后面四个被 aggregate 到一个 packet 里了
+https://en.wikipedia.org/wiki/Nagle%27s_algorithm
+Nagle's algorithm描述里:
+
+    if there is new data to send
+      if the window size >= MSS and available data is >= MSS
+        send complete MSS segment now
+      else
+        if there is unconfirmed data still in the pipe
+          enqueue data in the buffer until an acknowledge is received
+        else
+          send data immediately
+
+重点在“如果有未ACK的数据仍在pipe中，就buffer application的数据”
+发第一个a时执行的是 `send data immediately` 这句
+后面的4个a走了 `if there is until data still...` 于是被aggregate起来
+
+https://en.wikipedia.org/wiki/Transmission_Control_Protocol
+https://en.wikipedia.org/wiki/IPv4#Header
+https://en.wikipedia.org/wiki/Ethernet_frame
+顺便说一下1460的来历：
+Ethernet Frame maximum length 是 1518 (如果有VLAN tag则是1522)
+payload 最大 1500(因为Ethernet Header + Checksum 总共是18字节; VLAN 22字节)
+然后 1500 - 20(ip) - 20(tcp) == 1460
+如果是 UDP 的话 1500 - 20(ip) - 8(udp) == 1472
+
+http://serverfault.com/questions/422158/what-is-the-in-the-wire-size-of-a-ethernet-frame-1518-or-1542
+这里讲得挺清楚
+
+2015-12-14 21:55:32
+所以有关1460的故事主要是涉及“用户的data stream是怎么变成一个个TCP Segment的”
+当用户给的数据很大时，比如3000B
+os会给分成三段
+    [ACK] Len=1460
+    [ACK] Len=1460
+    [PSH, ACK] Len=80
+当数据很小时，比如5个'a'，Nagle会aggregate成2个Segment
+    [PSH, ACK] Len=1
+    [PSH, ACK] Len=4
+当设置了TCP_NODELAY时，5个Segment
+    [PSH, ACK] Len=1
+    [PSH, ACK] Len=1
+    [PSH, ACK] Len=1
+    [PSH, ACK] Len=1
+    [PSH, ACK] Len=1
+(貌似PSH flag还会影响到peer的delayed acknoledgement？)
+
+http://serverfault.com/questions/614590/what-is-psh-ack-doing-during-my-connection-to-a-global-catalog-server
+还有个TCP_QUICKACK的选项
+
+http://blog.mafr.de/2010/03/14/tcp-for-low-latency-applications/
+force a socket to send the data in its buffer
+Nagle's algorithm
+TCP_NODELAY
+这三者的关系还是不很清楚
+
+http://www.unixguide.net/network/socketfaq/2.11.shtml
+
+
+TCP_NODELAY与PSH flag没有必然关系，比如 sock.send('a' * 3000) 的时候
+前两个 1460 的 segment 还是 [ACK]，只有最后一个 80 的 segment 是 [PSH, ACK]
+
+2015-12-14 23:45:22
+http://edsiper.linuxchile.cl/blog/2013/02/21/linux-tcp-fastopen-in-your-sockets/
+shadowsocks 进行 async connect 的做法是 TCP FASTOPEN，用的是 tcpsock.sendto
+
+不使用fastopen的话可以
+    sock.setblocking(0)
+    sock.connect_ex(addr)
+    select.select(..)
+需要使用 connect_ex ，这样才不会抛出
+    [10035] A non-blocking socket operation could not be completed immediately
+的Exception
+
+2015-12-15 12:16:19
+发现 ubuntu 的MTU是1448——比windows的1460少了12字节
+哪来的？
+仔细看wireshark的结果显示多了个TCP Option:
+2字节的 NOP 用作padding, 然后是一个 10字节的 Timestamps
+
+https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_timestamps
+wiki提到 PAWS - Protection Against Wrapped Sequence
+好像在 man tcp 里也看到过
+
+2015-12-15 12:25:27
+http://baus.net/on-tcp_cork/
+TCP_CORK 的作用好像是让 TCP 只在 buffer 足够 segment 的时候发送
+但是实际实验显示又不完全是这样，，这些挺难设计精确控制的实验，觉得最好还是以后直接研究对应的内核源码
+
+http://stackoverflow.com/questions/3761276/when-should-i-use-tcp-nodelay-and-when-tcp-cork
+第3个答案有提到 cork 是有上限的(目前是200ms)，timeout一到不管够不够一个packet，os也会把数据发出去
+
+http://stackoverflow.com/questions/22117205/is-there-an-equivalent-to-tcp-cork-in-winsock
+这里用 TCP_NODELAY 在 windows 上实现了 TCP_CORK 的行为
+
+2015-12-15 12:37:07
+http://ithare.com/64-network-dos-and-donts-for-game-engine-developers-part-i-client-side/
+本来打算仔细过这个，但今天看了点发现是偏经验的，，那么mark一下以后再看了
+
+2015-12-15 14:43:16
+没看代码，但shadowsocks-linux-client里在 TCPRelayHandler 的 __init__ 里直接用 local_sock.getpeername()
+所以假定这个函数是不会 block 的：
+accept() 所得的 sock 内部已经有了 peer 的信息
+所以你看 python 的 accept 直接返回的是 sock, addr
+
+缕一下shadowsocks-linux-client的逻辑：
+先创建一个 lsock (listening sock)，加到 r_list 里
+当有连接到来时，accept 得到 sock (connection sock)，同样加到 r_list 里
+现在是为了读 user-app 的 greeting ('\x05\x00')
+...
+
+non-blocking mode 里的 send 之前是不需要检查的(EAFP)
+直接 send ，然后看发了多少，如果没发完，再去 select([], [sock], []) 以在将来继续发没发完的数据
+另外，不管发没发完，都要更新 select 所操作的 r/w_list

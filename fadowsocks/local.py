@@ -1,99 +1,158 @@
 import socket
+import select
 import struct
+import logging
+from collections import deque
 
-server_addr = ('104.224.168.15', 6569)
+import config_local as config
 
-def method2name(method):
-    try:
-        return {
-            '\x00': 'No authentication',
-            '\x01': 'GSSAPI',
-            '\x02': 'Username/Password',
-        }[method]
-    except KeyError:
-        if '\x03' <= method <= '\x7f':
-            return 'IANA assigned method'
-        elif '\x80' <= method <= '\xfe':
-            return 'Reserved method for private use'
-        else:
-            return 'Unknown'
+logging.basicConfig(level=logging.DEBUG)
 
-def rot13(s, encrypt=True):
-    direction = 1 if encrypt else -1
-    return ''.join(chr((ord(c) + 256 + 13 * direction) % 256) for c in s)
+SOCKS_VER_5 = '\x05'
 
-def delegate_to_server(local_sock, domain_name, port):
-    remote_sock = socket.socket()
-    remote_sock.connect(server_addr)
-    s = '\xf6'
-    s += struct.pack('!B', len(domain_name))
-    s += rot13(domain_name)
-    s += rot13(struct.pack('!H', port))
-    remote_sock.send(s)
-    while True:
-        data = local_sock.recv(1024)
-        if not data:
-            local_sock.close()
-            remote_sock.close()
-            break
-        print '->', repr(data)
-        data = rot13(data)
-        print '.>', repr(data)
-        remote_sock.send(data)
-        data = remote_sock.recv(1024)
-        if not data:
-            local_sock.close()
-            remote_sock.close()
-            break
-        print '<.', repr(data)
-        data = rot13(data, False)
-        print '<-', repr(data)
-        local_sock.send(data)
+BUF_SIZE = 32 * 1024
 
+class Listener(object):
+
+    def __init__(self, listen_sock):
+        self.listen_sock = listen_sock
+
+    def on_recv(self, _):
+        sock, addr = self.listen_sock.accept()
+        logging.debug('accept {}'.format(addr))
+        sock2handler[sock] = Relay(sock)
+        rs.add(sock)
+        ws.add(sock)
+        xs.add(sock)
+
+STATE_INIT = 0
+STATE_WAIT_FOR_CMD = 1
+STATE_RELAYING = 2
+
+class Relay(object):
+
+    def __init__(self, local_sock):
+        self.state = STATE_INIT
+        self.local_sock = local_sock
+        self.remote_sock = None
+        self.data_to_remote = deque()
+        self.data_to_local = deque()
+
+    def on_recv(self, sock):
+        if sock == self.local_sock:
+            self.on_local_recv()
+        elif sock == self.remote_sock:
+            self.on_remote_recv()
+
+    def on_send(self, sock):
+        if sock == self.local_sock:
+            data_to_send = self.data_to_local
+            dst = 'local'
+        elif sock == self.remote_sock:
+            data_to_send = self.data_to_remote
+            dst = 'remote'
+        try:
+            data = data_to_send[0]
+            n_sent = self.local_sock.send(data)
+            logging.debug('sent {} to {}'.format(repr(data[:n_sent]), dst))
+            if n_sent == len(data):
+                data_to_send.popleft()
+            else:
+                data_to_send[0] = data[n_sent:]
+        except IndexError:
+            #logging.debug('no data for {}'.format(dst))
+            pass
+
+    def on_local_recv(self):
+        if self.state == STATE_INIT:
+            greeting = self.local_sock.recv(BUF_SIZE)
+            logging.debug('greeting: {}'.format(repr(greeting)))
+            if not greeting:
+                self.destroy('peer closed')
+            if not greeting[0] == SOCKS_VER_5:
+                self.destroy('not SOCKS5')
+            self.data_to_local.append('\x05\x00')
+            self.state = STATE_WAIT_FOR_CMD
+        elif self.state == STATE_WAIT_FOR_CMD:
+            cmd = self.local_sock.recv(BUF_SIZE)
+            logging.debug('cmd: {}'.format(repr(cmd)))
+            cmd_code = cmd[1]
+            if cmd_code == '\x01': # establish TCP/IP stream connection
+                pass
+            elif cmd_code == '\x02': # establish TCP/IP port binding
+                self.destroy('request for port binding not implemented')
+                return
+            elif cmd_code == '\x03': # associate UDP port
+                self.destroy('request for UDP port assoc not implemented')
+                return
+            else:
+                self.destroy('unknown command code {}'.format(cmd_code))
+                return
+            addr_type = cmd[3]
+            if addr_type == '\x01': # IPv4 address
+                port_index = 8
+                host = '.'.join(str(int(struct.unpack('!B', byte)[0]))
+                                for byte in cmd[4:port_index])
+            elif addr_type == '\x03': # domain name
+                name_len = int(struct.unpack('!B', cmd[4])[0])
+                port_index = 5 + name_len
+                host = cmd[5:port_index]
+            else:
+                self.destroy('unsupport address')
+                return
+            port = int(struct.unpack('!H', cmd[port_index:port_index+2])[0])
+            logging.debug('request connect to {}:{}'.format(host, port))
+            sock = socket.socket()
+            sock2handler[sock] = self
+            sock.setblocking(0)
+            rs.add(sock)
+            ws.add(sock)
+            xs.add(sock)
+            self.remote_sock = sock
+            self.state = STATE_RELAYING
+            sock.connect_ex(config.server_addr)
+            logging.debug('connect to server at {}'.format(config.server_addr))
+        elif self.state == STATE_RELAYING:
+            print 'state == relaying'
+            data = self.local_sock.recv(BUF_SIZE)
+            print 'relay', repr(data)
+            self.data_to_remote.append(data)
+
+    def on_remote_recv(self):
+        data = self.remote_sock.recv(BUF_SIZE)
+        data = decrypt(data)
+        self.data_to_local.append(data)
+
+    def destroy(self, msg=''):
+        logging.debug('destroy {}: {}'.format(self, msg))
+        self.local_sock.close()
+        rs.discard(self.local_sock)
+        ws.discard(self.local_sock)
+        xs.discard(self.local_sock)
+        sock2handler.pop(self.local_sock, None)
+        if self.remote_sock:
+            self.remote_sock.close()
+            rs.discard(self.remote_sock)
+            ws.discard(self.remote_sock)
+            xs.discard(self.remote_sock)
+            sock2handler.pop(self.remote_sock, None)
+
+listen_addr = config.ip, config.port
 lsock = socket.socket()
-lsock.bind(('localhost', 6560))
+lsock.bind(listen_addr)
 lsock.listen(1024)
+logging.info('Listening on {}:{}'.format(*listen_addr))
+
+rs, ws, xs = set([lsock]), set(), set()
+sock2handler = {}
+sock2handler[lsock] = Listener(lsock)
+
 while True:
-    sock, addr = lsock.accept()
-    print 'accept', addr
-    socks_ver = sock.recv(1)
-    if socks_ver != '\x05':
-        sock.close()
-        continue
-    print 'got SOCKS5 greeting'
-    n_methods = int(struct.unpack('!B', sock.recv(1))[0])
-    if n_methods:
-        methods = sock.recv(n_methods)
-        print 'Method supported by client:'
-        for method in methods:
-            print ' ' * 4, method2name(method)
-    sock.send('\x05\x00')
-    socks_ver = sock.recv(1)
-    cmd = sock.recv(1)
-    if cmd == '\x01':
-        print 'establish a TCP/IP stream connection'
-    elif cmd == '\x02':
-        print 'establish a TCP/IP port binding'
-    elif cmd == '\x03':
-        print 'associate a UDP port'
-    reserved = sock.recv(1)
-    addr_type = sock.recv(1)
-    if addr_type == '\x01':
-        print 'IPv4 address'
-        break
-    elif addr_type == '\x03':
-        print 'Domain name'
-        name_len = int(struct.unpack('!B', sock.recv(1))[0])
-        domain_name = sock.recv(name_len)
-        print 'Domain name:', domain_name
-    elif addr_type == '\x04':
-        print 'IPv6 address'
-        break
-    port = int(struct.unpack('!H', sock.recv(2))[0])
-    print 'Port:', port
-    sock.send('\x05\x00\x00\x01' + '\x00' * 6)
-    print 'granted, delegate to server', server_addr
-    try:
-        delegate_to_server(sock, domain_name, port)
-    except Exception:
-        pass
+    r, w, x = select.select(rs, ws, xs, 1)
+    #logging.debug('select {}'.format(map(len, [r, w, x])))
+    for sock in r:
+        sock2handler[sock].on_recv(sock)
+    for sock in w:
+        sock2handler[sock].on_send(sock)
+    for sock in x:
+        sock2handler[sock].on_error(sock)
