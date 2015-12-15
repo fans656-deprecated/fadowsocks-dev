@@ -1,158 +1,161 @@
 import socket
 import select
 import struct
-import logging
-from collections import deque
 
-import config_local as config
+import config
+from common import parse_request_addr, encrypt, decrypt, BUF_SIZE
 
-logging.basicConfig(level=logging.DEBUG)
+STATE_WAIT_GREETING = 0
+STATE_WAIT_COMMAND = 1
+STATE_CONNECTING = 2
+STATE_RELAYING = 3
 
-SOCKS_VER_5 = '\x05'
+listen_addr = ('localhost', 6560)
 
-BUF_SIZE = 32 * 1024
+lsock = socket.socket()
+lsock.bind(listen_addr)
+lsock.listen(1024)
+print 'listening at', listen_addr
 
-class Listener(object):
+sock2handler = {}
 
-    def __init__(self, listen_sock):
-        self.listen_sock = listen_sock
-
-    def on_recv(self, _):
-        sock, addr = self.listen_sock.accept()
-        logging.debug('accept {}'.format(addr))
-        sock2handler[sock] = Relay(sock)
-        rs.add(sock)
-        ws.add(sock)
-        xs.add(sock)
-
-STATE_INIT = 0
-STATE_WAIT_FOR_CMD = 1
-STATE_RELAYING = 2
+def destroy_socket(sock):
+    if not sock:
+        return
+    sock.close()
+    rs.discard(sock)
+    ws.discard(sock)
+    xs.discard(sock)
+    sock2handler.pop(sock, None)
 
 class Relay(object):
 
     def __init__(self, local_sock):
-        self.state = STATE_INIT
+        local_sock.setblocking(0)
+        rs.add(local_sock)
+
+        self.state = STATE_WAIT_GREETING
+        self.data_to_local = []
+        self.data_to_remote = []
         self.local_sock = local_sock
+        self.local_addr = local_sock.getpeername()
         self.remote_sock = None
-        self.data_to_remote = deque()
-        self.data_to_local = deque()
+        self.request_addr = None
 
-    def on_recv(self, sock):
+    def on_read(self, sock):
+        data = sock.recv(BUF_SIZE)
+        if not data:
+            self.destroy()
+            return
         if sock == self.local_sock:
-            self.on_local_recv()
+            if self.state == STATE_WAIT_GREETING:
+                print 'got greeting from {}: {}'.format(
+                    sock.getpeername(), repr(data))
+                self.send('\x05\x00', self.local_sock)
+                self.state = STATE_WAIT_COMMAND
+            elif self.state == STATE_WAIT_COMMAND:
+                self.on_command(data)
+            elif self.state == STATE_CONNECTING:
+                self.data_to_remote.append(data)
+                print 'data from app while connecting:', repr(data)
+            else:
+                raise NotImplementedError('other state')
         elif sock == self.remote_sock:
-            self.on_remote_recv()
+            if self.state == STATE_CONNECTING:
+                self.state = STATE_RELAYING
+                if self.data_to_remote:
+                    data = ''.join(self.data_to_remote)
+                    self.data_to_remote = []
+                    data = encrypt(data)
+                    self.send(data, sock)
+            elif self.state == STATE_RELAYING:
+                data = decrypt(data)
+                self.send(data, self.local_sock)
+            else:
+                raise NotImplementedError('oops')
+        else:
+            raise Exception('oops')
 
-    def on_send(self, sock):
+    def on_write(self, sock):
         if sock == self.local_sock:
-            data_to_send = self.data_to_local
-            dst = 'local'
+            data = ''.join(self.data_to_local)
+            self.data_to_local = []
+            self.send(data, sock)
         elif sock == self.remote_sock:
-            data_to_send = self.data_to_remote
-            dst = 'remote'
+            if self.state == STATE_CONNECTING:
+                self.send(encrypt(self.cmd), sock)
+                rs.add(sock)
+            elif self.state == STATE_RELAYING:
+                data = ''.join(self.data_to_remote)
+                self.data_to_remote = []
+                self.send(encrypt(data), sock)
+            else:
+                raise Exception('oops')
+
+    def on_command(self, cmd):
+        print 'command:', repr(cmd)
         try:
-            data = data_to_send[0]
-            n_sent = self.local_sock.send(data)
-            logging.debug('sent {} to {}'.format(repr(data[:n_sent]), dst))
-            if n_sent == len(data):
-                data_to_send.popleft()
-            else:
-                data_to_send[0] = data[n_sent:]
-        except IndexError:
-            #logging.debug('no data for {}'.format(dst))
-            pass
-
-    def on_local_recv(self):
-        if self.state == STATE_INIT:
-            greeting = self.local_sock.recv(BUF_SIZE)
-            logging.debug('greeting: {}'.format(repr(greeting)))
-            if not greeting:
-                self.destroy('peer closed')
-            if not greeting[0] == SOCKS_VER_5:
-                self.destroy('not SOCKS5')
-            self.data_to_local.append('\x05\x00')
-            self.state = STATE_WAIT_FOR_CMD
-        elif self.state == STATE_WAIT_FOR_CMD:
-            cmd = self.local_sock.recv(BUF_SIZE)
-            logging.debug('cmd: {}'.format(repr(cmd)))
-            cmd_code = cmd[1]
-            if cmd_code == '\x01': # establish TCP/IP stream connection
-                pass
-            elif cmd_code == '\x02': # establish TCP/IP port binding
-                self.destroy('request for port binding not implemented')
-                return
-            elif cmd_code == '\x03': # associate UDP port
-                self.destroy('request for UDP port assoc not implemented')
-                return
-            else:
-                self.destroy('unknown command code {}'.format(cmd_code))
-                return
-            addr_type = cmd[3]
-            if addr_type == '\x01': # IPv4 address
-                port_index = 8
-                host = '.'.join(str(int(struct.unpack('!B', byte)[0]))
-                                for byte in cmd[4:port_index])
-            elif addr_type == '\x03': # domain name
-                name_len = int(struct.unpack('!B', cmd[4])[0])
-                port_index = 5 + name_len
-                host = cmd[5:port_index]
-            else:
-                self.destroy('unsupport address')
-                return
-            port = int(struct.unpack('!H', cmd[port_index:port_index+2])[0])
-            logging.debug('request connect to {}:{}'.format(host, port))
+            parse_request_addr(cmd)
+        except Exception as e:
+            print e
+            self.destroy()
+        else:
+            self.send('\x05\x00', self.local_sock)
+            self.cmd = cmd
             sock = socket.socket()
-            sock2handler[sock] = self
-            sock.setblocking(0)
-            rs.add(sock)
-            ws.add(sock)
-            xs.add(sock)
             self.remote_sock = sock
-            self.state = STATE_RELAYING
-            sock.connect_ex(config.server_addr)
-            logging.debug('connect to server at {}'.format(config.server_addr))
-        elif self.state == STATE_RELAYING:
-            print 'state == relaying'
-            data = self.local_sock.recv(BUF_SIZE)
-            print 'relay', repr(data)
-            self.data_to_remote.append(data)
+            sock.setblocking(0)
+            sock2handler[sock] = self
+            ws.add(sock)
+            self.state = STATE_CONNECTING
+            sock.connect_ex(config.server)
 
-    def on_remote_recv(self):
-        data = self.remote_sock.recv(BUF_SIZE)
-        data = decrypt(data)
-        self.data_to_local.append(data)
+    def send(self, data, sock):
+        n_total = len(data)
+        try:
+            n_sent = sock.send(data)
+        except socket.error as e:
+            self.destroy()
+            return
+        print 'sent to {}: {}'.format(
+            sock.getpeername(), repr(data[:n_sent][:70]))
+        if n_sent < n_total:
+            if sock == self.local_sock:
+                self.data_to_local.append(data[n_sent:])
+            elif sock == self.remote_sock:
+                self.data_to_remote.append(data[n_sent:])
+            else:
+                raise Exception('oops')
+            ws.add(sock)
+        else:
+            ws.discard(sock)
 
-    def destroy(self, msg=''):
-        logging.debug('destroy {}: {}'.format(self, msg))
-        self.local_sock.close()
-        rs.discard(self.local_sock)
-        ws.discard(self.local_sock)
-        xs.discard(self.local_sock)
-        sock2handler.pop(self.local_sock, None)
-        if self.remote_sock:
-            self.remote_sock.close()
-            rs.discard(self.remote_sock)
-            ws.discard(self.remote_sock)
-            xs.discard(self.remote_sock)
-            sock2handler.pop(self.remote_sock, None)
+    def destroy(self):
+        print 'closed', self.local_addr
+        destroy_socket(self.local_sock)
+        destroy_socket(self.remote_sock)
 
-listen_addr = config.ip, config.port
-lsock = socket.socket()
-lsock.bind(listen_addr)
-lsock.listen(1024)
-logging.info('Listening on {}:{}'.format(*listen_addr))
-
-rs, ws, xs = set([lsock]), set(), set()
-sock2handler = {}
-sock2handler[lsock] = Listener(lsock)
-
+rs, ws, xs = set([lsock]), set([]), set([])
 while True:
-    r, w, x = select.select(rs, ws, xs, 1)
-    #logging.debug('select {}'.format(map(len, [r, w, x])))
+    r, w, x = select.select(rs, ws, xs, 5)
     for sock in r:
-        sock2handler[sock].on_recv(sock)
+        # listening sock
+        if sock == lsock:
+            sock, addr = lsock.accept()
+            print 'accept', addr
+            sock2handler[sock] = Relay(sock)
+        # connection sock
+        else:
+            try:
+                handler = sock2handler[sock]
+            except KeyError:
+                rs.discard(sock)
+            handler.on_read(sock)
     for sock in w:
-        sock2handler[sock].on_send(sock)
-    for sock in x:
-        sock2handler[sock].on_error(sock)
+        try:
+            handler = sock2handler[sock]
+        except KeyError:
+            print '!!!!!', sock, 'not found'
+            exit()
+            ws.discard(sock)
+        handler.on_write(sock)
