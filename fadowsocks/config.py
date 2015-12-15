@@ -1,4 +1,4 @@
 import os
 
-host = os.envion.get('vps', 'localhost')
+host = os.environ.get('vps', 'localhost')
 server = (host, 6569)
